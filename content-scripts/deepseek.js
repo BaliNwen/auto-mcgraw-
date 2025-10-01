@@ -5,6 +5,22 @@ let observationTimeout = null;
 let checkIntervalId = null;
 let observer = null;
 
+// ---- Safe sendMessage wrapper ----
+function sendRuntimeMessage(msg) {
+  return new Promise((resolve, reject) => {
+    try {
+      chrome.runtime.sendMessage(msg, (response) => {
+        const err = chrome.runtime.lastError;
+        if (err) return reject(err);
+        resolve(response);
+      });
+    } catch (e) {
+      reject(e);
+    }
+  });
+}
+
+// ---- Listener ----
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === "receiveQuestion") {
     resetObservation();
@@ -23,10 +39,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendResponse({ received: false, error: error.message });
       });
 
-    return true;
+    return true; // keep channel open
   }
 });
 
+// ---- Reset ----
 function resetObservation() {
   hasResponded = false;
   if (observationTimeout) {
@@ -43,6 +60,7 @@ function resetObservation() {
   }
 }
 
+// ---- Insert Question ----
 async function insertQuestion(questionData) {
   const { type, question, options, previousCorrection } = questionData;
   let text = `Type: ${type}\nQuestion: ${question}`;
@@ -84,89 +102,107 @@ async function insertQuestion(questionData) {
 
   return new Promise((resolve, reject) => {
     const chatInput = document.getElementById("chat-input");
-    if (chatInput) {
-      setTimeout(() => {
-        chatInput.focus();
+    if (!chatInput) return reject(new Error("Input area not found"));
+
+    setTimeout(() => {
+      chatInput.focus();
+
+      const isContentEditable =
+        chatInput.isContentEditable ||
+        chatInput.getAttribute("contenteditable") === "true";
+
+      if (isContentEditable) {
+        chatInput.innerText = text;
+        const ev = new InputEvent("input", { bubbles: true, composed: true });
+        chatInput.dispatchEvent(ev);
+      } else {
         chatInput.value = text;
-        chatInput.dispatchEvent(new Event("input", { bubbles: true }));
+        const ev = new InputEvent("input", { bubbles: true, composed: true });
+        chatInput.dispatchEvent(ev);
+      }
 
-        setTimeout(() => {
-          const sendButtonSelectors = [
-            '[role="button"].f6d670',
-            ".f6d670",
-            '[role="button"]:has(svg path[d^="M7 16c"])',
-            'button[type="submit"]',
-            '[aria-label="Send message"]',
-            ".bf38813a button",
-            "button:has(svg)",
-            '[data-testid="send-button"]',
-          ];
+      setTimeout(() => {
+        const sendButtonSelectors = [
+          '[role="button"].f6d670',
+          ".f6d670",
+          'button[aria-label="Send message"]',
+          'button[type="submit"]',
+          '[data-testid="send-button"]',
+          ".bf38813a button",
+        ];
 
-          let sendButton = null;
-          for (const selector of sendButtonSelectors) {
-            try {
-              const button = document.querySelector(selector);
-              if (button && !button.disabled) {
-                sendButton = button;
-                break;
-              }
-            } catch (e) {
-              continue;
+        let sendButton = null;
+        for (const selector of sendButtonSelectors) {
+          try {
+            const button = document.querySelector(selector);
+            if (button && !button.disabled) {
+              sendButton = button;
+              break;
             }
+          } catch {
+            continue;
           }
+        }
 
-          if (sendButton) {
-            sendButton.click();
-            startObserving();
-            resolve();
-          } else {
-            reject(new Error("Send button not found"));
-          }
-        }, 300);
+        if (!sendButton) {
+          const btns = Array.from(document.querySelectorAll("button")).filter(
+            (b) => !b.disabled && b.querySelector("svg")
+          );
+          if (btns.length) sendButton = btns[0];
+        }
+
+        if (sendButton) {
+          sendButton.click();
+          startObserving();
+          resolve();
+        } else {
+          reject(new Error("Send button not found"));
+        }
       }, 300);
-    } else {
-      reject(new Error("Input area not found"));
-    }
+    }, 50);
   });
 }
 
-function processResponse(responseText) {
-  const cleanedText = responseText
-    .replace(/[\u200B-\u200D\uFEFF]/g, "")
-    .replace(/\n\s*/g, " ")
-    .trim();
+// ---- Process Response ----
+async function processResponse(responseText) {
+  const cleanedText = responseText.replace(/[\u200B-\u200D\uFEFF]/g, "").trim();
+
+  const fencedJsonMatch = cleanedText.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  let candidate = fencedJsonMatch ? fencedJsonMatch[1].trim() : null;
+
+  if (!candidate) {
+    const jsonMatch = cleanedText.match(
+      /\{[\s\S]*?"answer"[\s\S]*?"explanation"[\s\S]*?\}/i
+    );
+    candidate = jsonMatch ? jsonMatch[0] : cleanedText;
+  }
 
   try {
-    const parsed = JSON.parse(cleanedText);
+    const parsed = JSON.parse(candidate);
 
     if (parsed && parsed.answer && !hasResponded) {
       hasResponded = true;
-      chrome.runtime
-        .sendMessage({
+      try {
+        await sendRuntimeMessage({
           type: "deepseekResponse",
-          response: cleanedText,
-        })
-        .then(() => {
-          resetObservation();
-          return true;
-        })
-        .catch((error) => {
-          return false;
+          response: candidate,
         });
-
+      } catch (err) {
+        console.error("send message failed:", err);
+      }
+      resetObservation();
       return true;
     }
-  } catch (e) {
+  } catch {
     return false;
   }
 
   return false;
 }
 
+// ---- Response Checking ----
 function checkForResponse() {
-  if (hasResponded) {
-    return;
-  }
+  if (hasResponded) return;
 
   const messageSelectors = [
     "[data-testid='chat-message-assistant']",
@@ -184,9 +220,7 @@ function checkForResponse() {
     }
   }
 
-  if (messages.length <= messageCountAtQuestion) {
-    return;
-  }
+  if (messages.length <= messageCountAtQuestion) return;
 
   const newMessages = Array.from(messages).slice(messageCountAtQuestion);
 
@@ -201,29 +235,10 @@ function checkForResponse() {
 
     for (const selector of codeBlockSelectors) {
       const codeBlocks = message.querySelectorAll(selector);
-
       for (const block of codeBlocks) {
-        const parent = block.closest(
-          ".md-code-block, .code-block, .ds-markdown"
-        );
-
-        if (parent) {
-          const infoElements = parent.querySelectorAll(
-            '.d813de27, .md-code-block-infostring, [class*="json"], [class*="language"]'
-          );
-          const hasJsonInfo = Array.from(infoElements).some((el) =>
-            el.textContent.toLowerCase().includes("json")
-          );
-
-          if (hasJsonInfo || !infoElements.length) {
-            const responseText = block.textContent.trim();
-            if (
-              responseText.includes("{") &&
-              responseText.includes('"answer"')
-            ) {
-              if (processResponse(responseText)) return;
-            }
-          }
+        const responseText = block.textContent.trim();
+        if (responseText.includes("{") && responseText.includes('"answer"')) {
+          if (processResponse(responseText)) return;
         }
       }
     }
@@ -231,35 +246,31 @@ function checkForResponse() {
     const messageText = message.textContent.trim();
     const jsonMatch = messageText.match(/\{[\s\S]*?"answer"[\s\S]*?\}/);
     if (jsonMatch) {
-      const responseText = jsonMatch[0];
-      if (processResponse(responseText)) return;
+      if (processResponse(jsonMatch[0])) return;
     }
 
     if (Date.now() - observationStartTime > 30000) {
-      try {
-        const jsonPattern = /\{[\s\S]*?"answer"[\s\S]*?"explanation"[\s\S]*?\}/;
-        const jsonMatch = messageText.match(jsonPattern);
-
-        if (jsonMatch && !hasResponded) {
-          hasResponded = true;
-          chrome.runtime.sendMessage({
-            type: "deepseekResponse",
-            response: jsonMatch[0],
-          });
-          resetObservation();
-          return true;
-        }
-      } catch (e) {}
+      const jsonPattern =
+        /\{[\s\S]*?"answer"[\s\S]*?"explanation"[\s\S]*?\}/;
+      const lateMatch = messageText.match(jsonPattern);
+      if (lateMatch && !hasResponded) {
+        hasResponded = true;
+        sendRuntimeMessage({
+          type: "deepseekResponse",
+          response: lateMatch[0],
+        }).catch(() => {});
+        resetObservation();
+        return;
+      }
     }
   }
 }
 
+// ---- Observing ----
 function startObserving() {
   observationStartTime = Date.now();
   observationTimeout = setTimeout(() => {
-    if (!hasResponded) {
-      resetObservation();
-    }
+    if (!hasResponded) resetObservation();
   }, 180000);
 
   observer = new MutationObserver(() => {
@@ -270,7 +281,6 @@ function startObserving() {
     childList: true,
     subtree: true,
     characterData: true,
-    attributes: true,
   });
 
   checkIntervalId = setInterval(checkForResponse, 1000);
